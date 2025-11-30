@@ -1,0 +1,27 @@
+[package]
+name = "axvirtio-blk"
+version = "0.1.0"
+edition = "2024"
+authors = ["Axvisor Contributors"]
+description = "Virtio-blk virtual block device implementation for Axvisor"
+license = "GPL-3.0-or-later OR Apache-2.0 OR MulanPSL-2.0"
+
+[features]
+default = []
+fs = ["axstd/fs"]
+
+[dependencies]
+log = "0.4"
+spin = "0.9"
+cfg-if = "1.0"
+
+# System independent crates
+axerrno = "0.1.0"
+axaddrspace = "0.1"
+axdevice_base = "0.1"
+memory_addr = "0.4"
+
+# For file system access (when fs feature is enabled)
+[target.'cfg(not(target_arch = "wasm"))'.dependencies]
+axstd = { git = "https://github.com/arceos-hypervisor/arceos.git", branch = "vmm", optional = true, features = ["fs"] }
+
