@@ -134,6 +134,7 @@ Host 文件系统/块设备 (/dev/sdb 或普通文件)
 
 参考资料：https://rcore-os.cn/rCore-Tutorial-Book-v3/chapter9/2device-driver-2.html
 
+# Second Week
 ## Day 6
 
 大概写了个框架 
@@ -177,7 +178,101 @@ new 方法增加 inject_irq 参数。
 现在，当 Virtio-blk 设备完成 I/O 请求时，应该能正确地向 Guest OS 注入中断了。
 
 ## Day 10-12
-跑测试没跑通，11号更新分支后依旧没跑通。
+一开始跑测试没跑通
 
-![alt text](image-1.png)
-后来去群里询问了一下其他训练营同学，是需要根据镜像文件地址来修改toml配置文件，但是现在还没成功，卡三天了。
+![alt text](image-2.png)
+
+后来去群里询问了一下其他训练营同学，是需要根据镜像文件地址来修改toml配置文件，目前在测试链接块设备后加载客户机镜像。
+
+# Third Week
+
+## Day 13  
+
+成功在Axvisor上运行客户机，下面是我的解决方案（根据文档上的“快速启动”步骤加的修改）
+
+1. 核心修复：解决 Translation Fault
+这是导致 panic 的根本原因。
+
+问题: QEMU 模拟的硬件支持 48 位物理地址，导致 arm_vcpu 库自动开启 4 级页表。但 axaddrspace 配置为构建 3 级页表。这种不匹配导致了 Translation Fault。
+修改:
+arm_vcpu (依赖库): 修改了 src/vcpu.rs，强制将其配置为使用 3 级页表（即使硬件支持更多）。
+kernel/Cargo.toml: 禁用了 ept-level-4 特性，确保 axaddrspace 构建 3 级页表。
+kernel/src/hal/arch/aarch64/mod.rs: 允许在 48 位硬件上使用 3 级页表，将 panic 降级为 warning。
+
+```toml
+<!-- kernel/Cargo.toml -->
+
+[features]
+# ept-level-4 = ["axaddrspace/4-level-ept", "axvm/4-level-ept"]  <-- 注释掉此行
+fs = ["axstd/fs", "axruntime/fs"]
+
+```
+
+```rust
+// kernel/src/hal/arch/aarch64/mod.rs
+// 修改内容: 将检测到硬件支持 4 级页表但未启用该特性时的 panic! 降级为 warn!。
+#[cfg(not(feature = "ept-level-4"))]
+{
+    if level > 3 {
+        warn!(  // <-- 改为 warn!
+            "The hardware supports {}-level page tables, but the 4-level EPT feature is not enabled. Using 3-level page tables.",
+            level
+        );
+        // panic!(...) // <-- 注释掉 panic!
+    }
+}
+
+``` 
+
+2. 内存与 DTB 配置修复
+DTB 位置: 将 dtb_load_addr 修改为 0x4800_0000，确保其位于 Guest 有效内存范围内（之前是 0x8000_0000，越界了）。
+内存映射: 恢复使用 MAP_ALLOC (map_type = 0)，并将内核加载地址对齐到 0x4000_0000。
+
+```toml
+<!-- configs/vms/arceos-aarch64-qemu-smp1.toml -->
+<!-- 修改内容: 修正了内核路径、加载地址、DTB 地址和内存映射方式。 -->
+
+[kernel]
+entry_point = 0x4000_0000             # <-- 对齐到 RAM 起始地址
+image_location = "memory"             # <-- 改为 memory
+kernel_path = "/home/wyd/virt-blk/Axvisor/axvisor/tmp/images/qemu_aarch64_arceos/qemu-aarch64" # <-- 指向正确的二进制文件
+kernel_load_addr = 0x4000_0000        # <-- 对齐到 RAM 起始地址
+dtb_load_addr = 0x4800_0000           # <-- 修改为有效内存范围内的地址 (原为 0x8000_0000 越界)
+
+memory_regions = [
+  [0x4000_0000, 0x4000_0000, 0x7, 0], # <-- map_type 改为 0 (MAP_ALLOC)
+]
+
+```
+
+
+
+3. 基础环境修复
+磁盘镜像: 替换了损坏的镜像，使用了正确的 64MB disk.img。
+内核路径: 修正了配置文件中指向内核二进制文件的路径。
+构建配置: 修复了 tmp/configs/qemu-aarch64.toml 的格式错误并启用了 fs 特性。
+
+```toml
+<!-- tmp/configs/qemu-aarch64.toml -->
+<!-- 修改内容: 修复了格式错误，移除了 ept-level-4，添加了 fs 特性。 -->
+
+cargo_args = []
+features = [
+    "axstd/bus-mmio",
+    "dyn-plat",
+    "fs",             # <-- 添加 fs 特性
+]
+log = "Info"
+target = "aarch64-unknown-none-softfloat"
+to_bin = true
+vm_configs = []
+
+```
+
+```toml
+<!-- tmp/configs/qemu-aarch64-info.toml -->
+<!-- 修改内容: 更新了磁盘镜像路径。 -->
+
+"-drive",
+"id=disk0,if=none,format=raw,file=/home/wyd/virt-blk/Axvisor/axvisor/disk.img",
+```

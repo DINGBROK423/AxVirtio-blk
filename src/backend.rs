@@ -1,6 +1,7 @@
 //! Backend storage interface for virtio-blk device.
 
 use alloc::vec::Vec;
+use alloc::vec;
 use axerrno::{AxResult, ax_err, ax_err_type};
 use memory_addr::PhysAddr;
 

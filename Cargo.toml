@@ -20,6 +20,7 @@ axerrno = "0.1.0"
 axaddrspace = "0.1"
 axdevice_base = "0.1"
 memory_addr = "0.4"
+axvmconfig = { path = "../axvmconfig/axvmconfig" }
 
 # For file system access (when fs feature is enabled)
 [target.'cfg(not(target_arch = "wasm"))'.dependencies]

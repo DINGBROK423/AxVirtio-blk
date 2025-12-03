@@ -2,6 +2,7 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use alloc::{vec, format};
 use core::any::Any;
 use spin::Mutex;
 
@@ -10,6 +11,7 @@ use axdevice_base::{BaseDeviceOps, BaseMmioDeviceOps, EmuDeviceType};
 use axerrno::{AxResult, ax_err, ax_err_type};
 use axaddrspace::device::AccessWidth;
 use memory_addr::PhysAddr;
+use axvmconfig::VirtioBlkMmioDeviceConfig;
 
 use crate::backend::BlockBackend;
 use crate::virtio::{
@@ -21,6 +23,7 @@ use crate::backend::FileBackend;
 use crate::backend::MemoryBackend;
 
 /// Virtio descriptor structure (16 bytes)
+#[derive(Clone, Copy)]
 #[repr(C, packed)]
 struct VirtqDescriptor {
     addr: u64,      // Guest physical address
@@ -128,29 +131,36 @@ impl VirtioBlkDevice {
     /// Create a new virtio-blk device
     /// 
     /// # Arguments
-    /// * `base_gpa` - Base guest physical address of the device
-    /// * `size` - Size of the MMIO region
-    /// * `irq_id` - Interrupt ID for the device
-    /// * `backend_path` - Optional path to backend file/device. If None, uses memory backend.
+    /// * `config` - The configuration for the virtio-blk device
     /// * `read_guest_mem` - Function to read guest memory
     /// * `write_guest_mem` - Function to write guest memory
     /// * `inject_irq` - Function to inject interrupt
     pub fn new(
-        base_gpa: GuestPhysAddr,
-        size: usize,
-        irq_id: usize,
-        backend_path: Option<&str>,
+        config: &VirtioBlkMmioDeviceConfig,
         read_guest_mem: Arc<dyn Fn(GuestPhysAddr, usize) -> AxResult<Vec<u8>> + Send + Sync>,
         write_guest_mem: Arc<dyn Fn(GuestPhysAddr, &[u8]) -> AxResult<()> + Send + Sync>,
         inject_irq: Arc<dyn Fn(usize) -> AxResult + Send + Sync>,
     ) -> AxResult<Self> {
-        let backend: Arc<dyn BlockBackend> = if let Some(path) = backend_path {
+        let base_gpa = GuestPhysAddr::from(
+            usize::from_str_radix(config.mmio_base.trim_start_matches("0x"), 16)
+                .map_err(|_| ax_err_type!(InvalidInput, "Invalid MMIO base address"))?
+        );
+        let size = usize::from_str_radix(config.mmio_size.trim_start_matches("0x"), 16)
+            .map_err(|_| ax_err_type!(InvalidInput, "Invalid MMIO size"))?;
+        let irq_id = config.interrupt_number;
+
+        let backend: Arc<dyn BlockBackend> = if !config.backend_path.is_empty() {
             #[cfg(feature = "fs")]
             {
-                Arc::new(FileBackend::new(path)?)
+                Arc::new(FileBackend::new(&config.backend_path)?)
             }
             #[cfg(not(feature = "fs"))]
             {
+                // If backend path is specified but fs feature is disabled, we can't support it
+                // unless it's a special "memory" backend path or similar logic.
+                // For now, let's assume if path is not empty and no fs, it's an error or fallback.
+                // But to be safe and modular, let's warn and fallback to memory or error.
+                // Given the user requirement, let's error if fs is missing but path is provided.
                 return ax_err!(
                     Unsupported,
                     "File backend requires 'fs' feature to be enabled"
@@ -315,7 +325,7 @@ impl VirtioBlkDevice {
         let desc_table = self.read_guest(state.queue.desc, 
             desc_size * state.queue.size as usize)?;
         
-        let mut current = head_desc;
+        let mut current = *head_desc;
         let mut data_desc = None;
         
         // Traverse descriptor chain
@@ -366,7 +376,7 @@ impl VirtioBlkDevice {
         let desc_table = self.read_guest(state.queue.desc, 
             desc_size * state.queue.size as usize)?;
         
-        let mut current = head_desc;
+        let mut current = *head_desc;
         let mut data_desc = None;
         
         // Traverse descriptor chain
@@ -446,7 +456,7 @@ impl BaseDeviceOps<GuestPhysAddrRange> for VirtioBlkDevice {
     }
     
     fn address_range(&self) -> GuestPhysAddrRange {
-        GuestPhysAddrRange::new(self.base_gpa, self.size)
+        GuestPhysAddrRange::new(self.base_gpa, self.base_gpa + self.size)
     }
     
     fn handle_read(&self, addr: GuestPhysAddr, width: AccessWidth) -> AxResult<usize> {
