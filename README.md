@@ -4,13 +4,14 @@
 
 ## 功能特性
 
-- ✅ 完整的 Virtio MMIO 寄存器实现
-- ✅ Virtio 队列机制（descriptor ring, available ring, used ring）
-- ✅ 支持读写请求处理
-- ✅ 支持 Flush 请求
-- ✅ 文件后端存储（需要 `fs` feature）
-- ✅ 内存后端存储（用于测试）
-- ✅ 符合 `BaseMmioDeviceOps` trait 规范
+- ✅ 完整的 Virtio 1.0 MMIO 寄存器实现
+- ✅ 标准 Virtio 队列机制（Descriptor Ring, Available Ring, Used Ring）
+- ✅ 支持 Guest 物理内存访问
+- ✅ 支持中断注入
+- ✅ 支持读写 (`VIRTIO_BLK_T_IN`/`OUT`) 及 Flush (`VIRTIO_BLK_T_FLUSH`) 请求
+- ✅ 文件后端存储（需启用 `fs` feature，支持宿主机文件作为磁盘）
+- ✅ 内存后端存储（默认启用，适用于测试）
+
 
 ## 项目结构
 
@@ -18,97 +19,104 @@
 AxVirtio-blk/
 ├── src/
 │   ├── lib.rs          # 库入口
-│   ├── device.rs       # Virtio-blk 设备主实现
-│   ├── virtio.rs       # Virtio 协议常量和定义
-│   └── backend.rs       # 后端存储接口实现
-├── Cargo.toml          # 项目配置
-└── README.md           # 本文档
+│   ├── device.rs       # Virtio-blk 设备核心逻辑（MMIO处理、队列调度）
+│   ├── virtio.rs       # Virtio 协议标准常量定义
+│   └── backend.rs      # 后端存储抽象（MemoryBackend/FileBackend）
+├── Cargo.toml          # 项目依赖配置
+└── README.md           # 项目说明文档
 ```
 
 ## 使用方法
 
-### 1. 在 axdevice 中启用
+### 1. 依赖配置
 
-在 `Axdevice/axdevice/Cargo.toml` 中启用 feature：
+在 `Axdevice` 中引入：
 
 ```toml
+[dependencies]
+axvirtio-blk = { path = "../AxVirtio-blk" }
+
 [features]
-virtio-blk = ["axvirtio-blk"]
+# 如需支持文件后端，需启用 fs 特性
+default = []
+fs = ["axvirtio-blk/fs"]
 ```
 
-### 2. 在 VM 配置中添加设备
+### 2. VM 配置文件
 
-`axvmconfig` 的 `VMDevicesConfig` 已包含 `virtio_blk_mmio` 字段。示例：
+在 Axvisor 的 VM 配置文件（如 `tmp/configs/arceos-aarch64-qemu-smp1.toml`）中添加 `virtio_blk_mmio` 配置段。
+
+**配置示例及字段说明：**
 
 ```toml
-[devices]
-emu_devices = []
-passthrough_devices = []
-
+# Virtio-blk 设备配置列表
 [[devices.virtio_blk_mmio]]
-device_id = "virtio-blk@0"
-mmio_base = "0xa000000"
-mmio_size = "0x1000"
+# 设备唯一标识符，用于日志和调试
+device_id = "virtio-blk0"
+
+# MMIO 基地址 (Guest Physical Address)，需与 Guest 设备树/驱动匹配
+mmio_base = "0x0a000000"
+
+# MMIO 区域大小，Virtio MMIO 标准通常为 0x200 字节
+mmio_size = "0x200"
+
+# 中断类型，目前支持 "spi" (Shared Peripheral Interrupt)
 interrupt_type = "spi"
-interrupt_number = 32
-guest_device_path = "/dev/vblk0"
+
+# 中断号，需与 Guest 设备树/驱动匹配 (例如 48)
+interrupt_number = 48
+
+# Guest 内部设备路径标识（仅作元数据记录，不影响虚拟化逻辑）
+guest_device_path = "/dev/vda"
+
+# 后端类型："file" (文件) 或 "memory" (内存)
+# 注意：使用 "file" 类型需要编译时开启 `fs` feature
 backend_type = "file"
-backend_path = "/data/disk.img"
-size = "2G"
+
+# 后端文件路径。如果 backend_type="file"，此处指定宿主机镜像路径；如果是 "memory"，可留空
+backend_path = ""
+
+# 磁盘容量大小，支持 hex 字符串 (如 "0x4000000") 或带单位字符串 (如 "1G")
+size = "0x4000000"
+
+# 是否只读
 readonly = false
-serial = "axvblk0001"
+
+# 设备序列号，Guest 可通过通过相应命令读取
+serial = "vblk0"
 ```
 
-### 3. 构建和运行
+### 3. 构建与运行
+
+参照以下命令构建并启动带有 Virtio-blk 支持的 Axvisor：
+
+**1：运行 ArceOS SMP 示例**
 
 ```bash
-# 在 Axvisor 目录下
-cargo build --features virtio-blk
+cargo xtask qemu \
+--build-config tmp/configs/qemu-aarch64.toml \
+--qemu-config tmp/configs/qemu-aarch64-info.toml \
+--vmconfigs tmp/configs/arceos-aarch64-qemu-smp1.toml
 ```
 
-## 待完成的工作
+**2：运行 Block Test 示例**
 
-1. **实现 Guest 内存访问**
-   - 当前实现中，guest 内存访问函数是占位符
-   - 需要修改 `AxVmDevices` 以支持传递 VM 引用或 guest 内存访问函数
-   - 可以通过 `AxVM::read_from_guest_of` 和 `AxVM::write_to_guest_of` 来实现
+```bash
+cargo xtask qemu \
+--build-config tmp/configs/qemu-aarch64.toml \
+--qemu-config tmp/configs/qemu-aarch64-info.toml \
+--vmconfigs tmp/configs/arceos-blk-test.toml
+```
 
-2. **中断处理**
-   - 当前实现了中断状态寄存器，但需要与 GIC 集成以实际触发中断
+## 实现原理
 
-3. **完整测试**
-   - 需要在实际 VM 环境中测试设备功能
-   - 验证读写操作的正确性
+`AxVirtio-blk` 采用模块化的设计模式，实现了与 Axvisor的解耦：
 
-## 实现细节
+1.  **设备创建**：由 `Axdevice` 管理器根据 TOML 配置实例化 `VirtioBlkDevice`。
+2.  **函数注入**：实例化时传入 `read_guest_mem`、`write_guest_mem` 和 `inject_irq` 三个闭包函数。
+3.  **运行时**：
+    -   **MMIO 截获**：处理 Guest 对寄存器（如 Queue Notify）的读写。
+    -   **数据搬运**：利用注入的闭包在 Guest 物理内存和 Backend 存储之间拷贝数据。
+    -   **中断通知**：请求完成后，利用注入的闭包向 Guest 发送中断。
 
-### Virtio MMIO 寄存器
 
-设备实现了完整的 Virtio 1.0 MMIO 寄存器集：
-- Magic Value, Version, Device ID, Vendor ID
-- Device/Driver Features
-- Queue 配置（selector, size, addresses）
-- Interrupt Status
-- Device Status
-- Configuration Space（容量信息）
-
-### 队列处理
-
-设备支持标准的 Virtio 队列机制：
-- Descriptor Ring：存储请求描述符链
-- Available Ring：Guest 通知 Host 有新请求
-- Used Ring：Host 通知 Guest 请求完成
-
-### 后端存储
-
-支持两种后端：
-- **FileBackend**：使用 Host 文件系统文件（需要 `fs` feature）
-- **MemoryBackend**：内存后端，用于测试
-
-## 开发指南
-
-详细的集成指南请参考 `INTEGRATION.md`。
-
-## 许可证
-
-GPL-3.0-or-later OR Apache-2.0 OR MulanPSL-2.0

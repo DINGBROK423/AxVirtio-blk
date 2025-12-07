@@ -3,19 +3,20 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use alloc::{vec, format};
-use core::any::Any;
+
 use spin::Mutex;
 
 use axaddrspace::{GuestPhysAddr, GuestPhysAddrRange};
-use axdevice_base::{BaseDeviceOps, BaseMmioDeviceOps, EmuDeviceType};
-use axerrno::{AxResult, ax_err, ax_err_type};
+use axdevice_base::{BaseDeviceOps, EmuDeviceType};
+use axerrno::{AxResult, ax_err_type, AxErrorKind, ax_err};
 use axaddrspace::device::AccessWidth;
-use memory_addr::PhysAddr;
+
 use axvmconfig::VirtioBlkMmioDeviceConfig;
 
 use crate::backend::BlockBackend;
 use crate::virtio::{
-    blk, blk_status, desc_flags, features, mmio, status, VIRTIO_ID_BLOCK,
+    blk, blk_status, desc_flags,
+    features, mmio, VIRTIO_ID_BLOCK,
 };
 
 #[cfg(feature = "fs")]
@@ -170,6 +171,8 @@ impl VirtioBlkDevice {
             // Default to memory backend with 1GB
             Arc::new(MemoryBackend::new(1024 * 1024 * 1024))
         };
+        
+        log::info!("VirtioBlkDevice initialized with memory backend");
         
         Ok(Self {
             base_gpa,
@@ -459,7 +462,7 @@ impl BaseDeviceOps<GuestPhysAddrRange> for VirtioBlkDevice {
         GuestPhysAddrRange::new(self.base_gpa, self.base_gpa + self.size)
     }
     
-    fn handle_read(&self, addr: GuestPhysAddr, width: AccessWidth) -> AxResult<usize> {
+    fn handle_read(&self, addr: GuestPhysAddr, width: AccessWidth) -> Result<usize, AxErrorKind> {
         let offset = (addr.as_usize() - self.base_gpa.as_usize()) as usize;
         let val = match offset {
             mmio::MAGIC_VALUE => 0x74726976, // "virt" in little-endian
@@ -514,7 +517,7 @@ impl BaseDeviceOps<GuestPhysAddrRange> for VirtioBlkDevice {
                 }
             }
             _ => {
-                return ax_err!(InvalidInput, format!("Unhandled MMIO read at offset {:#x}", offset));
+                return Err(AxErrorKind::InvalidInput);
             }
         };
         
@@ -527,7 +530,7 @@ impl BaseDeviceOps<GuestPhysAddrRange> for VirtioBlkDevice {
         }
     }
     
-    fn handle_write(&self, addr: GuestPhysAddr, width: AccessWidth, val: usize) -> AxResult {
+    fn handle_write(&self, addr: GuestPhysAddr, _width: AccessWidth, val: usize) -> Result<(), AxErrorKind> {
         let offset = (addr.as_usize() - self.base_gpa.as_usize()) as usize;
         let val = val as u32;
         
@@ -579,7 +582,7 @@ impl BaseDeviceOps<GuestPhysAddrRange> for VirtioBlkDevice {
             }
             mmio::QUEUE_NOTIFY => {
                 drop(state); // Release lock before processing
-                self.process_queue()?;
+                self.process_queue().map_err(|_| AxErrorKind::InvalidInput)?;
                 return Ok(());
             }
             mmio::INTERRUPT_ACK => {
@@ -589,7 +592,7 @@ impl BaseDeviceOps<GuestPhysAddrRange> for VirtioBlkDevice {
                 state.device_status = val;
             }
             _ => {
-                return ax_err!(InvalidInput, format!("Unhandled MMIO write at offset {:#x}", offset));
+                return Err(AxErrorKind::InvalidInput);
             }
         }
         

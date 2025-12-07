@@ -276,3 +276,204 @@ vm_configs = []
 "-drive",
 "id=disk0,if=none,format=raw,file=/home/wyd/virt-blk/Axvisor/axvisor/disk.img",
 ```
+
+# Day 14-20
+
+成功接入虚拟块设备 AxVirtio-blk，并在ArceOS SMP测试中被GuestOS成功识别。
+
+采用模块化设计思想，将Virtio-blk设备的核心处理逻辑与AxVM解耦，在尽可能减少对arceos-hypervisor其他子仓库代码变动情况下，仅添加必要接口，引入依赖即成功接入虚拟块设备。
+
+当前块设备使用内存作为存储介质
+
+### 具体修改如下：
+
+#### 1.虚拟快设备模块：AxVirtio-blk
+详细说明见模块说明文档 vblock_project.md
+
+#### 2.axvmconfig
+
+2.1. 整合next分支和debin/add_virtio_mmio分支。
+
+因为我发现next分支版本领先于master,同时debin/add_virtio_mmio分支写好了我需要的Virtio-blk MMIO 设备所需的配置信息，不用自己重写一遍了，我在AxVirtio-blk模块中可以直接引用这些配置，所以将两个分支先进行了整合。
+
+2.2. 将axerrno版本升到0.2，这个是因为主仓库axvisor的axerrno版本是0.2，这个版本不升会产生一系列冲突。
+
+2.3. 添加必要字段：
+
+在 VMDevicesConfig
+（设备配置总表）中增加了 pub virtio_blk_mmio: Option<Vec<VirtioBlkMmioDeviceConfig>> 字段。
+
+在 EmulatedDeviceType 枚举中补充了 VirtioBlk = 0xE1。
+
+在 
+TemplateArgs
+ 中增加了 4 个命令行参数：
+--enable-virtio-blk: 启用标志
+--virtio-blk-backend-path: 后端镜像路径
+--virtio-blk-mmio-base: MMIO 基地址
+--virtio-blk-irq: 中断号
+
+get_vm_config_template
+ 函数新增了 virtio_blk_mmio 参数
+
+#### 3.Axdevice
+
+3.1. 将axerrno版本升到0.2 
+
+3.2. 配置结构扩展
+
+AxVmDeviceConfig：新增了 virtio_blk_configs 字段。
+
+构造函数调整：new 方法签名随之改变，现在需要传入 virtio_blk_configs 参数。
+
+3.3. 设备初始化
+
+AxVmDevices::new 现在接收三个关键回调：read_guest_mem, write_guest_mem, inject_irq。（读写内存和发送中断）
+
+新增了遍历 config.virtio_blk_configs 的循环，调用 VirtioBlkDevice::new 创建设备实例，并将其加入到 this.add_mmio_dev 管理列表中。
+
+handle_read/handle_write 的返回值被包裹在 Ok(...) 中，这是为了适配 axerrno 0.2.0 带来的接口变化。
+
+#### 4.axvm
+
+4.1. address_space类型加锁，因为 Virtio 设备是独立运行的，它需要并发访问 Guest 内存，所以必须用锁保护起来。
+
+4.2. Axdevice中调用的回调函数具体实现
+
+read_guest_mem 实现：
+
+捕获了 address_space 的引用。
+调用 translated_byte_buffer 将 Guest 物理地址（GPA）转换为主机虚拟地址（HVA）。
+将数据从 HVA 拷贝到临时的 Vec<u8> 中返回给设备。
+
+write_guest_mem 实现：
+
+同样捕获 address_space。
+拿到 HVA 后，将设备传入的 data 切片拷贝到 Guest 内存中。
+
+inject_irq 实现：
+
+捕获了 vm_id。
+直接调用 HAL 层的接口 H::inject_irq_to_vcpu(vm_id, 0, irq)，将中断注入给 0 号 vCPU。
+
+4.3. 在调用 axdevice::AxVmDevices::new 时，传入了上述准备好的回调函数和配置：
+
+```rust
+// axvm/src/vm/mod.rs
+// 在 AxVmDevices::new 中传入回调函数和配置
+let mut devices = axdevice::AxVmDevices::new(
+    AxVmDeviceConfig {
+        emu_configs: inner_mut.config.emu_devices().to_vec(),
+        virtio_blk_configs: inner_mut.config.virtio_blk_mmio().to_vec(),
+    },
+    read_guest_mem,
+    write_guest_mem,
+    inject_irq,
+);
+
+```
+
+#### 4.Axvisor
+
+新增测试 Workflow和相应配置
+
+configs/vms/arceos-aarch64-qemu-smp1-blk.toml
+
+（功能：输出hello world）
+
+```toml
+# Virtio-blk devices.
+[[devices.virtio_blk_mmio]]
+device_id = "virtio-blk0"
+mmio_base = "0x0a000000"
+mmio_size = "0x200"
+interrupt_type = "spi"
+interrupt_number = 48
+guest_device_path = "/dev/vda"
+backend_type = "file"
+backend_path = ""
+size = "0x4000000"
+readonly = false
+serial = "vblk0"
+```
+
+.github/workflows/qemu-aarch64-blk.toml
+
+```toml
+[[device.virtio_blk_mmio]]
+path = "disk.img"
+mmio_base = 0x0a003e00
+mmio_size = 0x200
+irq = 48
+
+```
+
+另外还写了一个用来测试块设备读写的样例，但是由于缺乏Host 到 Guest 的中断注入通道实现，当前Axvisor 只支持SPI（共享中断），客户机 Timer 的配置是 PPI（私有中断），无法进入到应用程序启动就已经崩溃。
+
+
+
+
+**总结：**
+
+```
+AxVirtio-blk ................. [新增库] 独立的 Virtio-blk 虚拟块设备库
+├── Cargo.toml ............... 定义库依赖，新增 `fs` 特性支持文件后端；依赖 `axvmconfig` 0.1 和 `axerrno` 0.2。
+├── README.md ................ [修改] 更新项目文档。添加详细的配置字段说明、ArceOS 启动命令示例及功能特性列表。
+└── src
+    ├── device.rs ............ 设备核心。实现 Virtio 1.0 MMIO 协议；通过闭包回调解耦 Guest 内存读写和中断注入。
+    ├── backend.rs ........... 存储后端。实现 BlockBackend trait，提供 FileBackend (宿主机文件) 和 MemoryBackend (内存)。
+    └── virtio.rs ............ 协议定义。定义 Virtio-blk 标准常量、寄存器偏移、Feature Bits 和请求格式。
+
+axvmconfig ................... [修改库] 虚拟机配置管理库
+└── axvmconfig
+    ├── Cargo.toml ........... [修改] 升级 axerrno 至 0.2 以匹配主仓库依赖。
+    └── src
+        ├── lib.rs ........... [修改] 类型定义。新增 VirtioBlkMmioDeviceConfig 结构体；在 VMDevicesConfig 中增加 virtio_blk_mmio 字段。
+        ├── tool.rs .......... [修改] CLI 增强。在 TemplateArgs 中新增 --enable-virtio-blk 等4个参数，实现命令行注入配置逻辑。
+        └── templates.rs ..... [修改] 模板接口。更新 get_vm_config_template 签名，支持透传块设备配置到最终 TOML。
+
+Axdevice ..................... [修改库] 虚拟设备管理库
+└── axdevice
+    ├── Cargo.toml ........... [修改] 依赖变更。引入本地 AxVirtio-blk 依赖；切换 axvmconfig 为 git 依赖；升级 axerrno。
+    └── src
+        ├── config.rs ........ [修改] 配置扩展。AxVmDeviceConfig 新增 virtio_blk_configs 字段用于传递设备配置。
+        └── device.rs ........ [修改] 设备集成。AxVmDevices::new 增加入参(3个回调)；遍历配置实例化 VirtioBlkDevice 并注册到 MMIO 总线。
+
+axvm ......................... [修改库] 虚拟机核心库
+└── axvm
+    ├── Cargo.toml ........... [修改] 依赖变更。切换 axvmconfig 为 git 依赖。
+    └── src
+        └── vm.rs ............ [修改] 运行时对接。1. AddressSpace 加锁(Arc<Mutex>)以支持并发；2. 实现并传入读写内存/注入中断的闭包回调；3. 初始化 AxVmDevices。
+
+Axvisor (Main Repo) .......... [修改] 主仓库
+└── axvisor
+    └── configs
+        └── vms
+            └── arceos-aarch64-qemu-smp1.toml ... [新增] 配置文件示例。包含 [[devices.virtio_blk_mmio]] 完整配置段。
+```
+
+### 测试情况
+
+运行命令：
+
+```
+cargo xtask qemu \        
+--build-config tmp/configs/qemu-aarch64.toml \
+--qemu-config tmp/configs/qemu-aarch64-info.toml \
+--vmconfigs tmp/configs/arceos-aarch64-qemu-smp1.toml
+```
+
+![alt text](9bc62bf203b3d42ec7919cd35e39c574.png)
+
+![alt text](bd25444bb89df2db936516930b6383ac.png)
+
+如图可以判断成功接入块设备
+
+### TODO LIST
+☑ 虚拟块设备接入
+
+☐ 中断注入问题处理
+
+☐ 虚拟快设备读写测试
+
+☐ 持久化存储功能
