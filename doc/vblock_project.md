@@ -199,6 +199,24 @@ arm_vcpu (依赖库): 修改了 src/vcpu.rs，强制将其配置为使用 3 级�
 kernel/Cargo.toml: 禁用了 ept-level-4 特性，确保 axaddrspace 构建 3 级页表。
 kernel/src/hal/arch/aarch64/mod.rs: 允许在 48 位硬件上使用 3 级页表，将 panic 降级为 warning。
 
+```rust
+//   /Axvisor/axvisor/crates/arm_vcpu/src/vcpu.rs
+//  核心修复 - 强制 3 级页表：
+
+// 创建了本地 arm_vcpu 副本
+// 修改 probe_vtcr_support() 函数强制使用 3 级页表（SL0 = Level1, T0SZ = 25 for 39-bit IPA）
+// 在 Cargo.toml 中添加 patch 指向本地副本
+// Force 3-level page tables (SL0 = Level1, T0SZ for 39-bit IPA)
+let mut val = VTCR_EL2::SL0::Granule4KBLevel1 + VTCR_EL2::T0SZ.val(64 - 39);
+
+
+pub(crate) fn max_gpt_level(_pa_bits: usize) -> usize {
+    // Force 3-level page tables to match axaddrspace configuration
+    // Original logic: match pa_bits { 44.. => 4, _ => 3 }
+    3
+}
+
+```
 ```toml
 <!-- kernel/Cargo.toml -->
 
