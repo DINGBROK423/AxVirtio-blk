@@ -2,8 +2,9 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use alloc::{vec, format};
+use alloc::vec;
 
+use log::{error, info};
 use spin::Mutex;
 
 use axaddrspace::{GuestPhysAddr, GuestPhysAddrRange};
@@ -106,6 +107,8 @@ struct VirtioBlkState {
     
     // Queue state
     queue: VirtQueue,
+    // Track last processed avail index
+    last_avail_idx: u16,
 }
 
 /// Virtio-blk device
@@ -186,6 +189,7 @@ impl VirtioBlkDevice {
                 device_status: 0,
                 interrupt_status: 0,
                 queue: VirtQueue::new(),
+                last_avail_idx: 0,
             }),
             backend,
             read_guest_mem,
@@ -219,6 +223,7 @@ impl VirtioBlkDevice {
     fn process_queue(&self) -> AxResult {
         let mut state = self.state.lock();
         if !state.queue.ready {
+            info!("process_queue: queue not ready");
             return Ok(());
         }
         
@@ -231,36 +236,71 @@ impl VirtioBlkDevice {
             avail_ring[3],
         ]);
         
-        // Process each available descriptor
-        let mut processed = 0;
-        while processed < avail_idx {
-            let ring_idx = (4 + processed as usize * 2) % avail_ring.len();
+        // Only process new requests since last_avail_idx
+        let last_avail_idx = state.last_avail_idx;
+        let queue_size = state.queue.size;
+        
+        info!("process_queue: avail_idx={}, last_avail_idx={}, queue_size={}", 
+              avail_idx, last_avail_idx, queue_size);
+        
+        // Calculate number of new requests (handle wrap-around)
+        let num_new = avail_idx.wrapping_sub(last_avail_idx);
+        if num_new == 0 {
+            info!("process_queue: no new requests");
+            return Ok(());
+        }
+        
+        info!("process_queue: processing {} new requests", num_new);
+        
+        // Process each new available descriptor
+        let mut processed = 0u16;
+        while processed < num_new {
+            // Calculate ring index (with wrap-around)
+            let ring_slot = (last_avail_idx.wrapping_add(processed)) % queue_size;
+            let ring_offset = 4 + ring_slot as usize * 2;
+            
+            if ring_offset + 1 >= avail_ring.len() {
+                break;
+            }
+            
             let desc_idx = u16::from_le_bytes([
-                avail_ring[ring_idx],
-                avail_ring[ring_idx + 1],
+                avail_ring[ring_offset],
+                avail_ring[ring_offset + 1],
             ]);
             
             // Process the request
             drop(state); // Release lock before processing
             self.process_request(desc_idx)?;
+            
+            // Update used ring for this request
+            self.update_used_ring(1, desc_idx)?;
+            
             state = self.state.lock();
             processed += 1;
         }
         
-        // Update used ring
-        drop(state);
-        self.update_used_ring(processed)?;
+        // Update last_avail_idx
+        state.last_avail_idx = avail_idx;
         
         Ok(())
     }
     
     /// Process a single virtio-blk request
     fn process_request(&self, head_desc_idx: u16) -> AxResult {
-        let state = self.state.lock();
-        // Read descriptor table
+        info!("process_request: head_desc_idx={}", head_desc_idx);
+        
+        // Get queue info while holding lock, then release immediately
+        let (queue_desc, queue_size) = {
+            let state = self.state.lock();
+            (state.queue.desc, state.queue.size)
+        };
+        
+        // Read descriptor table (lock released)
         let desc_size = core::mem::size_of::<VirtqDescriptor>();
-        let desc_table_size = desc_size * state.queue.size as usize;
-        let desc_table = self.read_guest(state.queue.desc, desc_table_size)?;
+        let desc_table_size = desc_size * queue_size as usize;
+        info!("process_request: reading desc table at {:?}, size={}", queue_desc, desc_table_size);
+        let desc_table = self.read_guest(queue_desc, desc_table_size)?;
+        info!("process_request: desc table read ok");
         
         // Read the head descriptor
         let head_offset = head_desc_idx as usize * desc_size;
@@ -273,12 +313,19 @@ impl VirtioBlkDevice {
                 desc_table.as_ptr().add(head_offset) as *const VirtqDescriptor
             )
         };
+        let desc_addr = head_desc.addr;
+        let desc_len = head_desc.len;
+        let desc_flags = head_desc.flags;
+        info!("process_request: head_desc addr={:#x}, len={}, flags={:#x}", 
+              desc_addr, desc_len, desc_flags);
         
         // Read request header (first descriptor)
+        info!("process_request: reading req header from GPA {:#x}", desc_addr);
         let req_buf = self.read_guest(
-            GuestPhysAddr::from(head_desc.addr as usize),
-            head_desc.len as usize
+            GuestPhysAddr::from(desc_addr as usize),
+            desc_len as usize
         )?;
+        info!("process_request: req header read ok, len={}", req_buf.len());
         
         if req_buf.len() < core::mem::size_of::<VirtioBlkReq>() {
             return ax_err!(InvalidInput, "Request too short");
@@ -288,61 +335,106 @@ impl VirtioBlkDevice {
             core::ptr::read_unaligned(req_buf.as_ptr() as *const VirtioBlkReq)
         };
         
-        // Process based on request type
-        let status = match req.req_type {
+        let req_type = req.req_type;
+        let req_sector = req.sector;
+        info!("process_request: req_type={}, sector={}", req_type, req_sector);
+        
+        // Process based on request type (no lock held here)
+        let status = match req_type {
             blk::VIRTIO_BLK_T_IN => {
+                info!("process_request: handling READ request");
                 // Read request - find data descriptor
-                self.handle_read_request(&head_desc, req.sector)?
+                self.handle_read_request(&head_desc, &desc_table, req_sector)?
             }
             blk::VIRTIO_BLK_T_OUT => {
+                info!("process_request: handling WRITE request");
                 // Write request
-                self.handle_write_request(&head_desc, req.sector)?
+                self.handle_write_request(&head_desc, &desc_table, req_sector)?
             }
             blk::VIRTIO_BLK_T_FLUSH => {
+                info!("process_request: handling FLUSH request");
                 self.backend.flush()?;
                 blk_status::VIRTIO_BLK_S_OK
             }
             blk::VIRTIO_BLK_T_GET_ID => {
+                info!("process_request: handling GET_ID request (unsupported)");
                 // Return device ID (not implemented)
                 blk_status::VIRTIO_BLK_S_UNSUPP
             }
-            _ => blk_status::VIRTIO_BLK_S_UNSUPP,
+            _ => {
+                info!("process_request: unknown request type {}", req_type);
+                blk_status::VIRTIO_BLK_S_UNSUPP
+            }
         };
         
-        // Write status back (usually in the last descriptor)
-        // For simplicity, we'll write it after the request header
-        let status_byte = [status];
-        self.write_guest(
-            GuestPhysAddr::from(head_desc.addr as usize + core::mem::size_of::<VirtioBlkReq>()),
-            &status_byte
-        )?;
+        info!("process_request: status={}", status);
+        
+        // Find the status descriptor (last in chain, has WRITE flag)
+        // VirtIO blk request: header -> data -> status(1 byte, WRITE)
+        let desc_size = core::mem::size_of::<VirtqDescriptor>();
+        let mut current = head_desc;
+        let mut status_desc_addr = None;
+        
+        loop {
+            let cur_flags = current.flags;
+            let cur_next = current.next;
+            let cur_addr = current.addr;
+            
+            // Check if this is the last descriptor or has WRITE flag with small len (status)
+            if (cur_flags & desc_flags::VIRTQ_DESC_F_NEXT) == 0 {
+                // Last descriptor is the status
+                status_desc_addr = Some(cur_addr);
+                break;
+            }
+            
+            let next_offset = cur_next as usize * desc_size;
+            if next_offset + desc_size > desc_table.len() {
+                break;
+            }
+            
+            current = unsafe {
+                core::ptr::read_unaligned(
+                    desc_table.as_ptr().add(next_offset) as *const VirtqDescriptor
+                )
+            };
+        }
+        
+        if let Some(status_addr) = status_desc_addr {
+            info!("process_request: writing status {} to GPA {:#x}", status, status_addr);
+            let status_byte = [status];
+            self.write_guest(
+                GuestPhysAddr::from(status_addr as usize),
+                &status_byte
+            )?;
+        } else {
+            error!("process_request: no status descriptor found");
+        }
         
         Ok(())
     }
     
     /// Handle read request
-    fn handle_read_request(&self, head_desc: &VirtqDescriptor, sector: u64) -> AxResult<u8> {
-        let state = self.state.lock();
-        // Find the data descriptor (WRITE flag set)
+    fn handle_read_request(&self, head_desc: &VirtqDescriptor, desc_table: &[u8], sector: u64) -> AxResult<u8> {
         let desc_size = core::mem::size_of::<VirtqDescriptor>();
-        let desc_table = self.read_guest(state.queue.desc, 
-            desc_size * state.queue.size as usize)?;
         
         let mut current = *head_desc;
         let mut data_desc = None;
         
         // Traverse descriptor chain
         loop {
-            if (current.flags & desc_flags::VIRTQ_DESC_F_WRITE) != 0 {
+            let cur_flags = current.flags;
+            let cur_next = current.next;
+            
+            if (cur_flags & desc_flags::VIRTQ_DESC_F_WRITE) != 0 {
                 data_desc = Some(current);
                 break;
             }
             
-            if (current.flags & desc_flags::VIRTQ_DESC_F_NEXT) == 0 {
+            if (cur_flags & desc_flags::VIRTQ_DESC_F_NEXT) == 0 {
                 break;
             }
             
-            let next_offset = current.next as usize * desc_size;
+            let next_offset = cur_next as usize * desc_size;
             if next_offset + desc_size > desc_table.len() {
                 break;
             }
@@ -355,13 +447,15 @@ impl VirtioBlkDevice {
         }
         
         if let Some(desc) = data_desc {
+            let desc_addr = desc.addr;
+            let desc_len = desc.len;
             let offset = sector * self.backend.block_size();
-            let mut data = vec![0u8; desc.len as usize];
+            let mut data = vec![0u8; desc_len as usize];
             let bytes_read = self.backend.read(offset, &mut data)?;
             
             // Write data to guest memory
             self.write_guest(
-                GuestPhysAddr::from(desc.addr as usize),
+                GuestPhysAddr::from(desc_addr as usize),
                 &data[..bytes_read]
             )?;
             
@@ -372,29 +466,33 @@ impl VirtioBlkDevice {
     }
     
     /// Handle write request
-    fn handle_write_request(&self, head_desc: &VirtqDescriptor, sector: u64) -> AxResult<u8> {
-        let state = self.state.lock();
+    fn handle_write_request(&self, head_desc: &VirtqDescriptor, desc_table: &[u8], sector: u64) -> AxResult<u8> {
+        info!("handle_write_request: sector={}", sector);
+        
         // Find the data descriptor (no WRITE flag)
         let desc_size = core::mem::size_of::<VirtqDescriptor>();
-        let desc_table = self.read_guest(state.queue.desc, 
-            desc_size * state.queue.size as usize)?;
         
         let mut current = *head_desc;
         let mut data_desc = None;
         
         // Traverse descriptor chain
         loop {
-            if (current.flags & desc_flags::VIRTQ_DESC_F_WRITE) == 0 && 
-               current.addr != head_desc.addr {
+            let cur_flags = current.flags;
+            let cur_addr = current.addr;
+            let cur_next = current.next;
+            let head_addr = head_desc.addr;
+            
+            if (cur_flags & desc_flags::VIRTQ_DESC_F_WRITE) == 0 && 
+               cur_addr != head_addr {
                 data_desc = Some(current);
                 break;
             }
             
-            if (current.flags & desc_flags::VIRTQ_DESC_F_NEXT) == 0 {
+            if (cur_flags & desc_flags::VIRTQ_DESC_F_NEXT) == 0 {
                 break;
             }
             
-            let next_offset = current.next as usize * desc_size;
+            let next_offset = cur_next as usize * desc_size;
             if next_offset + desc_size > desc_table.len() {
                 break;
             }
@@ -407,47 +505,84 @@ impl VirtioBlkDevice {
         }
         
         if let Some(desc) = data_desc {
+            let desc_addr = desc.addr;
+            let desc_len = desc.len;
+            info!("handle_write_request: found data desc addr={:#x}, len={}", desc_addr, desc_len);
             // Read data from guest memory
             let data = self.read_guest(
-                GuestPhysAddr::from(desc.addr as usize),
-                desc.len as usize
+                GuestPhysAddr::from(desc_addr as usize),
+                desc_len as usize
             )?;
+            info!("handle_write_request: read {} bytes from guest", data.len());
             
             // Write to backend
             let offset = sector * self.backend.block_size();
+            info!("handle_write_request: writing to backend offset={}", offset);
             self.backend.write(offset, &data)?;
+            info!("handle_write_request: write complete");
             
             Ok(blk_status::VIRTIO_BLK_S_OK)
         } else {
+            error!("handle_write_request: no data descriptor found");
             Ok(blk_status::VIRTIO_BLK_S_IOERR)
         }
     }
     
     /// Update used ring
-    fn update_used_ring(&self, num_processed: u16) -> AxResult {
+    fn update_used_ring(&self, num_processed: u16, head_desc_idx: u16) -> AxResult {
         if num_processed == 0 {
             return Ok(());
         }
         
-        let mut state = self.state.lock();
-        // Read current used ring
-        let used_ring_size = 4 + core::mem::size_of::<VirtqUsedElem>() * state.queue.size as usize;
-        let mut used_ring = self.read_guest(state.queue.used, used_ring_size)?;
+        info!("update_used_ring: num_processed={}, head_desc_idx={}", num_processed, head_desc_idx);
         
-        // Update used ring index
-        let used_idx = u16::from_le_bytes([used_ring[2], used_ring[3]]);
+        // Get queue info without holding lock during I/O
+        let (queue_used, queue_size) = {
+            let state = self.state.lock();
+            (state.queue.used, state.queue.size)
+        };
+        
+        // Read current used ring header (flags + idx = 4 bytes)
+        let used_header = self.read_guest(queue_used, 4)?;
+        
+        // Get current used index
+        let used_idx = u16::from_le_bytes([used_header[2], used_header[3]]);
+        info!("update_used_ring: current used_idx={}", used_idx);
+        
+        // Calculate position in ring for new entry
+        let ring_pos = (used_idx % queue_size) as usize;
+        
+        // Write the used element (id=4bytes, len=4bytes = 8 bytes)
+        // Offset: header(4) + ring_pos * sizeof(VirtqUsedElem)
+        let elem_offset = 4 + ring_pos * core::mem::size_of::<VirtqUsedElem>();
+        let mut used_elem = [0u8; 8];
+        used_elem[0..4].copy_from_slice(&(head_desc_idx as u32).to_le_bytes());
+        used_elem[4..8].copy_from_slice(&(512u32).to_le_bytes()); // len written
+        
+        self.write_guest(
+            GuestPhysAddr::from(queue_used.as_usize() + elem_offset),
+            &used_elem
+        )?;
+        
+        // Update used index
         let new_used_idx = used_idx.wrapping_add(num_processed);
-        used_ring[2] = (new_used_idx & 0xff) as u8;
-        used_ring[3] = ((new_used_idx >> 8) & 0xff) as u8;
+        let new_idx_bytes = new_used_idx.to_le_bytes();
+        self.write_guest(
+            GuestPhysAddr::from(queue_used.as_usize() + 2),
+            &new_idx_bytes
+        )?;
+        info!("update_used_ring: new used_idx={}", new_used_idx);
         
-        // Write back
-        self.write_guest(state.queue.used, &used_ring)?;
-        
-        // Set interrupt status
-        state.interrupt_status |= 1;
+        // Set interrupt status and inject
+        {
+            let mut state = self.state.lock();
+            state.interrupt_status |= 1;
+        }
         
         // Inject interrupt
+        info!("update_used_ring: injecting IRQ {}", self.irq_id);
         (self.inject_irq)(self.irq_id)?;
+        info!("update_used_ring: IRQ injected");
         
         Ok(())
     }
@@ -464,6 +599,74 @@ impl BaseDeviceOps<GuestPhysAddrRange> for VirtioBlkDevice {
     
     fn handle_read(&self, addr: GuestPhysAddr, width: AccessWidth) -> Result<usize, AxErrorKind> {
         let offset = (addr.as_usize() - self.base_gpa.as_usize()) as usize;
+        
+        // Handle config space reads (offset >= 0x100)
+        if offset >= mmio::CONFIG {
+            let capacity = self.backend.size() / 512;
+            let mut config_space = Vec::new();
+            config_space.extend_from_slice(&(capacity as u64).to_le_bytes()); // capacity (8 bytes)
+            config_space.extend_from_slice(&[0u8; 4]); // size_max (not set)
+            config_space.extend_from_slice(&[0u8; 4]); // seg_max (not set)
+            
+            // Geometry
+            config_space.extend_from_slice(&[0u8; 2]); // cylinders
+            config_space.extend_from_slice(&[0u8; 1]); // heads
+            config_space.extend_from_slice(&[0u8; 1]); // sectors
+            
+            config_space.extend_from_slice(&[0u8; 4]); // blk_size (not set)
+            config_space.extend_from_slice(&[0u8; 1]); // physical_block_exp
+            config_space.extend_from_slice(&[0u8; 1]); // alignment_offset
+            config_space.extend_from_slice(&[0u8; 2]); // min_io_size
+            config_space.extend_from_slice(&[0u8; 4]); // opt_io_size
+            
+            let config_offset = offset - mmio::CONFIG;
+            let val = match width {
+                AccessWidth::Byte => {
+                    if config_offset < config_space.len() {
+                        config_space[config_offset] as usize
+                    } else {
+                        0
+                    }
+                }
+                AccessWidth::Word => {
+                    if config_offset + 1 < config_space.len() {
+                        u16::from_le_bytes([config_space[config_offset], config_space[config_offset + 1]]) as usize
+                    } else {
+                        0
+                    }
+                }
+                AccessWidth::Dword => {
+                    if config_offset + 3 < config_space.len() {
+                        u32::from_le_bytes([
+                            config_space[config_offset],
+                            config_space[config_offset + 1],
+                            config_space[config_offset + 2],
+                            config_space[config_offset + 3],
+                        ]) as usize
+                    } else {
+                        0
+                    }
+                }
+                AccessWidth::Qword => {
+                    if config_offset + 7 < config_space.len() {
+                        u64::from_le_bytes([
+                            config_space[config_offset],
+                            config_space[config_offset + 1],
+                            config_space[config_offset + 2],
+                            config_space[config_offset + 3],
+                            config_space[config_offset + 4],
+                            config_space[config_offset + 5],
+                            config_space[config_offset + 6],
+                            config_space[config_offset + 7],
+                        ]) as usize
+                    } else {
+                        0
+                    }
+                }
+            };
+            return Ok(val);
+        }
+        
         let val = match offset {
             mmio::MAGIC_VALUE => 0x74726976, // "virt" in little-endian
             mmio::VERSION => 2, // Virtio 1.0
@@ -479,8 +682,12 @@ impl BaseDeviceOps<GuestPhysAddrRange> for VirtioBlkDevice {
                 }
             }
             mmio::QUEUE_NUM_MAX => {
+                // Return maximum queue size supported by the device (typically 256 for VirtIO)
+                256_usize
+            }
+            mmio::QUEUE_READY => {
                 let state = self.state.lock();
-                state.queue.size as usize
+                state.queue.ready as usize
             }
             mmio::INTERRUPT_STATUS => {
                 let state = self.state.lock();
@@ -490,33 +697,8 @@ impl BaseDeviceOps<GuestPhysAddrRange> for VirtioBlkDevice {
                 let state = self.state.lock();
                 state.device_status as usize
             }
-            mmio::CONFIG => {
-                let capacity = self.backend.size() / 512;
-                let mut config_space = Vec::new();
-                config_space.extend_from_slice(&(capacity as u64).to_le_bytes()); // capacity
-                config_space.extend_from_slice(&[0u8; 4]); // size_max (not set)
-                config_space.extend_from_slice(&[0u8; 4]); // seg_max (not set)
-                
-                // Geometry
-                config_space.extend_from_slice(&[0u8; 2]); // cylinders
-                config_space.extend_from_slice(&[0u8; 1]); // heads
-                config_space.extend_from_slice(&[0u8; 1]); // sectors
-                
-                config_space.extend_from_slice(&[0u8; 4]); // blk_size (not set)
-                config_space.extend_from_slice(&[0u8; 1]); // physical_block_exp
-                config_space.extend_from_slice(&[0u8; 1]); // alignment_offset
-                config_space.extend_from_slice(&[0u8; 2]); // min_io_size
-                config_space.extend_from_slice(&[0u8; 4]); // opt_io_size
-                
-                // Return byte at offset relative to config space
-                let config_offset = offset - mmio::CONFIG;
-                if config_offset < config_space.len() {
-                    config_space[config_offset] as usize
-                } else {
-                    0
-                }
-            }
             _ => {
+                error!("handle_read: unknown offset {:#x}", offset);
                 return Err(AxErrorKind::InvalidInput);
             }
         };
@@ -581,8 +763,12 @@ impl BaseDeviceOps<GuestPhysAddrRange> for VirtioBlkDevice {
                 state.queue.used = GuestPhysAddr::from((low | high) as usize);
             }
             mmio::QUEUE_NOTIFY => {
+                info!("QUEUE_NOTIFY received, queue_sel={}", state.queue_sel);
                 drop(state); // Release lock before processing
-                self.process_queue().map_err(|_| AxErrorKind::InvalidInput)?;
+                if let Err(e) = self.process_queue() {
+                    error!("process_queue failed: {:?}", e);
+                    return Err(AxErrorKind::InvalidInput);
+                }
                 return Ok(());
             }
             mmio::INTERRUPT_ACK => {
