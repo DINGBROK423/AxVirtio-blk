@@ -495,3 +495,140 @@ cargo xtask qemu \
 ☐ 虚拟快设备读写测试
 
 ☐ 持久化存储功能
+
+# Day 21-34
+
+学校考试和其他事都集中在这两周了，导致工作量有所下降。用两个周末时间集中处理了测试镜像构建以及块设备读写测试和debug。最终成功通过测试，基于内存后端的Virtio协议的虚拟块设备顺利完成。利用下周时间尝试完成基于arceos文件系统后端扩展，总结工作并提交相关仓库pr。
+
+### 测试成功截图
+
+探测块设备测试成功：
+![alt text](3430b7700e407efe65bbb559f8d085e4.png)
+
+读写测试块设备成功：
+![alt text](08faaf1ef21fe38b056b2e1705c912e8.png)
+![alt text](5407c27f50759d9cf46206ad824a424a.png)
+![alt text](93b4c2555523292a2d0b2ad17dbe3edd.png)
+
+测试内容：
+
+1. 写入操作：(Step4)
+2. 目标扇区: Sector 0
+3. 数据大小: 512 字节 (1个扇区)
+3. 数据内容: 前 8 字节: "AXVISOR!" (ASCII 签名) 后 504 字节: 全部填充 0xA5 (TEST_PATTERN)
+
+### 测试镜像构建
+
+一、镜像配置文件
+
+```toml
+[package]
+name = "arceos-blktest"
+version = "0.1.0"
+edition.workspace = true
+authors = ["ArceOS Contributors"]
+
+[features]
+default = ["axstd"]
+axstd = ["dep:axstd"]
+
+[dependencies]
+axstd = { workspace = true, optional = true, features = ["alloc", "paging"] }
+virtio-drivers = "0.7"
+```
+
+二、测试应用核心逻辑
+
+使用 virtio-drivers crate 初始化 VirtIO Block 设备
+
+写入 512 字节数据到 Sector 0（签名 "AXVISOR!" + 填充 0xA5）
+
+读取 Sector 0 并验证数据完整性
+
+三、GuestOS 配置文件
+
+```toml
+# Axvisor VM configuration for ArceOS blktest
+[base]
+id = 1
+name = "arceos-blktest"
+vm_type = 1
+cpu_num = 1
+phys_cpu_ids = [0]
+
+[kernel]
+entry_point = 0x4000_0000
+image_location = "memory"
+kernel_path = "/workspaces/arceos/Axvisor/axvisor/tmp/guest-images/arceos-blktest-aarch64.bin"
+kernel_load_addr = 0x4000_0000
+dtb_load_addr = 0x4800_0000
+
+# Use 256MB of memory to avoid allocation failure.
+memory_regions = [
+  [0x4000_0000, 0x1000_0000, 0x7, 0],
+]
+
+[devices]
+passthrough_devices = []
+passthrough_addresses = [
+    [0x09000000, 0x1000],   # UART
+    [0x08000000, 0x10000],  # GICD
+    [0x080a0000, 0xf0000],  # GICR
+]
+excluded_devices = [
+    ["/pcie@10000000"],
+]
+emu_devices = []
+interrupt_mode = "passthrough"
+
+# Virtio block device (AxVirtio-blk)
+[[devices.virtio_blk_mmio]]
+device_id = "blk0"
+mmio_base = "0x0a000000"
+mmio_size = "0x200"
+interrupt_type = "spi"
+interrupt_number = 48
+guest_device_path = "/dev/vda"
+backend_type = "memory"
+backend_path = ""
+size = "0x4000000"
+readonly = false
+serial = "blktest-disk0"
+```
+四、构建ArceOS测试镜像
+
+```
+# 构建 blktest 应用：使用 aarch64-axvisor-guest 平台配置
+cd /workspaces/arceos
+make A=examples/blktest \
+     ARCH=aarch64 \
+     PLATFORM=aarch64-axvisor-guest \
+     LOG=warn \
+     build
+```
+### 测试时发现的问题与解决
+
+1. blktest 直接使用物理地址 0x0a00_0000 访问 MMIO，但 ArceOS guest 使用虚拟地址空间，需要把物理地址转换为虚拟地址，添加上对应偏移量。
+
+2. 由于Axvisor没有实现中断，基本读写采用用轮询模式，但是MMIO 读取必须要正确路由到设备模拟。这时遇到问题：**Passthrough 设备区域被直接映射到 Stage-2 页表**，passthrough_devices = ["/"] 会把所有根节点下的设备（包括其他 VirtIO slots）都映射为 passthrough。这导致了：0x0a000000-0x0a004000 (VirtIO MMIO) 被映射到 Stage-2 页表
+Guest 直接访问 QEMU 的硬件 VirtIO 设备（slot 0 是空的，所以 Device ID = 0）AxVirtio-blk 的 handle_read() 根本不会被调用。
+
+这里我的解决方法：
+
+在 VM 配置中不使用 passthrough_devices = ["/"]，而是明确指定不包含 VirtIO MMIO 区域的设备。通过禁用 Stage-2 页面直通，成功让 Guest 对 0x0a000000 地址的访问触发异常并进入 Axvisor 的模拟逻辑。
+
+3. 虚拟块设备debug
+
+(部分寄存器处理实现不完全（有的偏移没被识别），ring死锁问题，状态字节写入地址错误等，均已解决)
+
+### 工作总结
+
+☑ 虚拟块设备接入
+
+☐ 中断注入问题处理
+
+☑ 虚拟快设备读写测试
+
+☐ 持久化存储功能
+
+
