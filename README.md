@@ -34,7 +34,7 @@ AxVirtio-blk/
 
 ```toml
 [dependencies]
-axvirtio-blk = { path = "../AxVirtio-blk" }
+axvirtio-blk = { git = "https://github.com/DINGBROK423/AxVirtio-blk.git", branch = "p1", default-features = false }
 
 [features]
 # 如需支持文件后端，需启用 fs 特性
@@ -99,13 +99,12 @@ cargo xtask qemu \
 --vmconfigs tmp/configs/arceos-aarch64-qemu-smp1.toml
 ```
 
-**2：运行 Block Test 示例**
+**2：运行 Block R/W Test 示例**
 
 ```bash
 cargo xtask qemu \
 --build-config tmp/configs/qemu-aarch64.toml \
---qemu-config tmp/configs/qemu-aarch64-info.toml \
---vmconfigs tmp/configs/arceos-blk-test.toml
+--qemu-config tmp/configs/qemu-aarch64-info.toml --vmconfigs tmp/configs/arceos-blktest-aarch64-qemu-smp1.toml
 ```
 
 ## 实现原理
