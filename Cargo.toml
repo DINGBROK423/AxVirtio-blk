@@ -8,7 +8,7 @@ license = "GPL-3.0-or-later OR Apache-2.0 OR MulanPSL-2.0"
 
 [features]
 default = []
-fs = ["axstd/fs"]
+fs = ["dep:axstd"]
 
 [dependencies]
 log = "0.4"
@@ -22,8 +22,7 @@ axdevice_base = "0.1"
 memory_addr = "0.4"
 axvmconfig = { git = "https://github.com/DINGBROK423/axvmconfig.git", branch = "merge_add_virtio_mmio", default-features = false }
 
-
 # For file system access (when fs feature is enabled)
-[target.'cfg(not(target_arch = "wasm"))'.dependencies]
-axstd = { git = "https://github.com/arceos-hypervisor/arceos.git", branch = "vmm", optional = true, features = ["fs"] }
+# Use the same axstd version as axvisor to avoid version conflicts
+axstd = { git = "https://github.com/arceos-org/arceos.git", tag = "dev-251202", optional = true, features = ["fs"] }
 

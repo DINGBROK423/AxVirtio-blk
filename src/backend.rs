@@ -29,8 +29,9 @@ pub trait BlockBackend: Send + Sync {
 mod fs_backend {
     use super::*;
     use alloc::sync::Arc;
+    use alloc::format;
     use spin::Mutex;
-    use axstd::fs::File;
+    use axstd::fs::{File, OpenOptions};
     use axstd::io::{Read, Write, Seek, SeekFrom};
 
     /// File-based backend storage
@@ -43,12 +44,17 @@ mod fs_backend {
     impl FileBackend {
         /// Create a new file backend from a file path
         pub fn new(path: &str) -> AxResult<Self> {
-            let file = File::open(path).map_err(|e| {
-                ax_err_type!(
-                    NotFound,
-                    format!("Failed to open backend file {}: {:?}", path, e)
-                )
-            })?;
+            // Open file with read/write access for block device operations
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .map_err(|e| {
+                    ax_err_type!(
+                        NotFound,
+                        format!("Failed to open backend file {}: {:?}", path, e)
+                    )
+                })?;
             
             let metadata = file.metadata().map_err(|e| {
                 ax_err_type!(
