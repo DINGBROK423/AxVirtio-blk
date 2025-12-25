@@ -9,7 +9,7 @@
 - ✅ 支持 Guest 物理内存访问
 - ✅ 支持中断注入
 - ✅ 支持读写 (`VIRTIO_BLK_T_IN`/`OUT`) 及 Flush (`VIRTIO_BLK_T_FLUSH`) 请求
-- ✅ 文件后端存储（需启用 `fs` feature，支持宿主机文件作为磁盘）
+- ✅ 文件后端存储（需启用 `fs` feature， Axvisor (Hypervisor) 提供文件系统，具体来说是 ArceOS 的 axfs 模块。）
 - ✅ 内存后端存储（默认启用，适用于测试）
 
 
@@ -99,14 +99,19 @@ cargo xtask qemu \
 --vmconfigs tmp/configs/arceos-aarch64-qemu-smp1.toml
 ```
 
-**2：运行 Block R/W Test 示例**
+**2：运行 Block -memory后端 R/W Test 示例**
 
 ```bash
 cargo xtask qemu \
 --build-config tmp/configs/qemu-aarch64.toml \
 --qemu-config tmp/configs/qemu-aarch64-info.toml --vmconfigs tmp/configs/arceos-blktest-aarch64-qemu-smp1.toml
 ```
-
+**3：运行 Block -fs后端 R/W Test 示例**
+```bash
+cargo xtask qemu \
+--build-config tmp/configs/qemu-aarch64-fs.toml \
+--qemu-config tmp/configs/qemu-aarch64-info-fs.toml --vmconfigs tmp/configs/arceos-blktest-aarch64-qemu-smp1-fs.toml
+```
 ## 实现原理
 
 `AxVirtio-blk` 采用模块化的设计模式，实现了与 Axvisor的解耦：

@@ -153,10 +153,10 @@ impl VirtioBlkDevice {
             .map_err(|_| ax_err_type!(InvalidInput, "Invalid MMIO size"))?;
         let irq_id = config.interrupt_number;
 
-        let backend: Arc<dyn BlockBackend> = if !config.backend_path.is_empty() {
+        let (backend, backend_type): (Arc<dyn BlockBackend>, &str) = if !config.backend_path.is_empty() {
             #[cfg(feature = "fs")]
             {
-                Arc::new(FileBackend::new(&config.backend_path)?)
+                (Arc::new(FileBackend::new(&config.backend_path)?), "file")
             }
             #[cfg(not(feature = "fs"))]
             {
@@ -172,10 +172,11 @@ impl VirtioBlkDevice {
             }
         } else {
             // Default to memory backend with 1GB
-            Arc::new(MemoryBackend::new(1024 * 1024 * 1024))
+            (Arc::new(MemoryBackend::new(1024 * 1024 * 1024)), "memory")
         };
         
-        log::info!("VirtioBlkDevice initialized with memory backend");
+        log::info!("VirtioBlkDevice initialized with {} backend (size: {} bytes)", 
+                   backend_type, backend.size());
         
         Ok(Self {
             base_gpa,

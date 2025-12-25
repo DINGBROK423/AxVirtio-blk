@@ -204,10 +204,90 @@ pub struct FileBackend {
 }
 ```
 
+架构层次
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  宿主机 Linux                                                    │
+│  └── blktest-disk.img (64MB FAT32 文件)                         │
+│       └── guest-disk.img (16MB raw 文件，存储在 FAT32 内)        │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼ QEMU virtio-blk-device
+┌─────────────────────────────────────────────────────────────────┐
+│  Axvisor (Hypervisor)  运行在 QEMU 中                            │
+│  ├── axdriver: 初始化 virtio-blk 驱动                           │
+│  ├── axfs: 挂载 FAT32 文件系统 (根目录 /)                        │
+│  │    └── /guest-disk.img  ← FileBackend 打开这个文件            │
+│  └── axdevice/axvirtio-blk: 创建虚拟块设备给 Guest VM            │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼ AxVirtio-blk MMIO 设备
+┌─────────────────────────────────────────────────────────────────┐
+│  Guest VM (ArceOS blktest)                                       │
+│  └── 通过 virtio-blk 驱动访问虚拟磁盘                            │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### 使用方式
+
+**1. Axvisor 启动时初始化文件系统：**
+
+```rust
+// axruntime 初始化流程中
+axfs::init()  // 挂载 FAT32 到根目录 /
+```
+
+**2. AxVirtio-blk 的 FileBackend 通过 axstd 访问文件：**
+
+```rust
+// virt-blk/AxVirtio-blk/src/backend.rs
+use axstd::fs::{File, OpenOptions};
+use axstd::io::{Read, Write, Seek, SeekFrom};
+
+impl FileBackend {
+    pub fn new(path: &str) -> AxResult<Self> {
+        // 通过 axstd 的文件系统 API 打开文件
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?;  // path = "/guest-disk.img"
+        // ...
+    }
+}
+```
+
+**3. 依赖链：**
+
+```
+axvirtio-blk
+    └── axstd (with fs feature)
+            └── axfs (ArceOS 文件系统模块)
+                    └── fatfs (FAT32 实现)
+                            └── virtio-blk driver
+                                    └── QEMU 提供的 blktest-disk.img
+```
+
+#### 关键配置
+
+**VM 配置文件 (arceos-blktest-aarch64-qemu-smp1-fs.toml)：**
+```toml
+[[devices.virtio_blk_mmio]]
+backend_type = "file"
+backend_path = "/guest-disk.img"  # Axvisor 文件系统内的路径
+```
+
+**QEMU 配置 (qemu-aarch64-info-fs.toml)：**
+```toml
+args = [
+  "-device", "virtio-blk-device,drive=disk0",
+  "-drive", "id=disk0,if=none,format=raw,file=.../blktest-disk.img",
+]
+```
+
 **特点**:
-- 使用宿主机文件作为虚拟磁盘
-- 支持持久化存储
-- 需要 `axstd` 的文件系统支持
+- Axvisor (Hypervisor) 提供文件系统，具体来说是 ArceOS 的 axfs 模块。
+- FileBackend 依赖 **axstd** 的文件操作 API，而 axstd 底层使用 ArceOS 的 **axfs** 模块，axfs 使用 **fatfs** crate 实现 FAT32 文件系统。
 
 #### 3.2.3 MemoryBackend（内存后端）
 
@@ -560,7 +640,7 @@ pub trait BlockBackend: Send + Sync {
 mmio_base = "0x0a000000"        # MMIO 基地址
 mmio_size = "0x200"             # MMIO 区域大小 (512 字节)
 interrupt_number = 48           # 中断号
-backend_path = "memory"  # 后端文件路径（可选）
+backend_path = "memory"  # 后端文件路径（可选 fs or memory）
 ```
 
 **说明**:
@@ -568,6 +648,24 @@ backend_path = "memory"  # 后端文件路径（可选）
 - 若指定路径，需启用 `fs` feature
 
 ### 7.3 典型配置示例
+
+**fs后端**:
+
+```toml
+[[devices.virtio_blk_mmio]]
+device_id = "blk0"
+mmio_base = "0x0a000000"
+mmio_size = "0x200"
+interrupt_type = "spi"
+interrupt_number = 48
+guest_device_path = "/dev/vda"
+backend_type = "file"
+backend_path = "/guest-disk.img"
+size = "0x1000000"           # 16MB (matches the guest-disk.img size)
+readonly = false
+serial = "blktest-fs-disk0"
+```
+
 
 **内存后端**:
 

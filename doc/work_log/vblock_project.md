@@ -631,4 +631,80 @@ Guest 直接访问 QEMU 的硬件 VirtIO 设备（slot 0 是空的，所以 Devi
 
 ☐ 持久化存储功能
 
+# Day 35-38
+
+完成 ArceOS axfs文件系统作为块设备后端存储测试，至此，GuestOS块设备内存后端与文件系统后端均通过测试。测试镜像和测试脚本已添加到：https://github.com/DINGBROK423/axvisor/tree/next2-vblock tests文件夹下
+
+## 修改汇总
+
+### 1. axvirtio-blk（本地路径：AxVirtio-blk）
+
+| 文件 | 修改内容 |
+|------|----------|
+| Cargo.toml | 将 `axstd` 依赖从 `arceos-hypervisor/arceos.git branch=vmm` 改为 `arceos-org/arceos.git tag=dev-251202`，与 axvisor 保持一致 |
+| backend.rs | 1. 添加 `use alloc::format;`<br>2. 添加 `use axstd::fs::OpenOptions;`<br>3. 将 `File::open()` 改为 `OpenOptions::new().read(true).write(true).open()` 以读写方式打开文件 |
+
+---
+
+### 2. axdevice（本地路径：axdevice）
+
+| 文件 | 修改内容 |
+|------|----------|
+| Cargo.toml | 1. 添加 `fs = ["axvirtio-blk/fs"]` feature 定义<br>2. 将 `axvirtio-blk` 依赖从 git URL 改为本地路径 |
+
+```toml
+# 添加的 feature
+[features]
+default = []
+fs = ["axvirtio-blk/fs"]
+```
+---
+
+### 3. axvisor（本地路径：axvisor）
+
+| 文件 | 修改内容 |
+|------|----------|
+| kernel/Cargo.toml | 在 `fs` feature 中添加 `"axdevice/fs"` 传递 |
+
+
+**Cargo.toml 修改：**
+
+```toml
+fs = ["axstd/fs", "axruntime/fs", "axdevice/fs"]
+```
+
+---
+
+### 4. 新增配置文件（`tmp/configs/` 目录）
+
+| 文件 | 用途 |
+|------|------|
+| arceos-blktest-aarch64-qemu-smp1-fs.toml | VM 配置：使用 FileBackend，`backend_path = "/guest-disk.img"` |
+| `qemu-aarch64-fs.toml` | 构建配置：启用 `fs` feature |
+| qemu-aarch64-info-fs.toml | QEMU 配置：挂载 FAT32 磁盘镜像 |
+
+---
+
+### 5. 磁盘镜像（`tmp/images/` 目录）
+
+| 文件 | 说明 |
+|------|------|
+| `qemu_aarch64_blktest_fs/blktest-disk.img` | 64MB FAT32 镜像，作为 Axvisor 的根文件系统 |
+| 镜像内 `/guest-disk.img` | 16MB raw 文件，作为 Guest VM 的虚拟磁盘后端 |
+
+---
+
+### Feature 传递链（完整）
+
+```
+axvisor (--features fs)
+    ↓
+kernel/Cargo.toml: fs = [..., "axdevice/fs"]
+    ↓
+axdevice/Cargo.toml: fs = ["axvirtio-blk/fs"]
+    ↓
+axvirtio-blk/Cargo.toml: fs = ["dep:axstd"]
+    ↓
+FileBackend 模块启用 (#[cfg(feature = "fs")])
+```
 
